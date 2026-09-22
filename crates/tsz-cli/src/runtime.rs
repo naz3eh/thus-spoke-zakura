@@ -378,6 +378,30 @@ fn format_zec(zatoshi: u64) -> String {
     }
 }
 
+#[derive(Debug)]
+struct HostPorts {
+    dashboard: u16,
+    rpc: u16,
+    p2p: u16,
+    lightwalletd: u16,
+}
+
+fn host_ports(offset: u16) -> Result<HostPorts> {
+    if !offset.is_multiple_of(10) {
+        bail!("--port-offset must be a multiple of 10 (got {offset})");
+    }
+    Ok(HostPorts {
+        dashboard: 32805 + offset,
+        rpc: 18232 + offset,
+        p2p: 18233 + offset,
+        lightwalletd: 9067 + offset,
+    })
+}
+
+fn loopback_publish(host: u16, container: u16) -> String {
+    format!("127.0.0.1:{host}:{container}")
+}
+
 fn prefix(name: &InstanceName) -> String {
     format!("tsz-{name}")
 }
@@ -400,6 +424,9 @@ fn ensure_volume(volume: &str, name: &InstanceName) -> Result<()> {
 fn ensure_zakura(prefix: &str, name: &InstanceName) -> Result<()> {
     let target = format!("{prefix}-zakura");
     if !container_exists(&target)? {
+        let ports = host_ports(0)?;
+        let rpc_bind = loopback_publish(ports.rpc, 18232);
+        let p2p_bind = loopback_publish(ports.p2p, 18233);
         docker([
             "create",
             "--name",
@@ -411,9 +438,9 @@ fn ensure_zakura(prefix: &str, name: &InstanceName) -> Result<()> {
             "--label",
             &label(name),
             "-p",
-            "127.0.0.1::18232",
+            &rpc_bind,
             "-p",
-            "127.0.0.1::18233",
+            &p2p_bind,
             "-v",
             &format!("{prefix}-chain:/data"),
             "-v",
@@ -431,6 +458,8 @@ fn ensure_lightwalletd(prefix: &str, name: &InstanceName) -> Result<()> {
     let target = format!("{prefix}-lightwalletd");
     if !container_exists(&target)? {
         let image = lightwalletd_image();
+        let ports = host_ports(0)?;
+        let lightwalletd_bind = loopback_publish(ports.lightwalletd, 9067);
         docker([
             "create",
             "--name",
@@ -444,7 +473,7 @@ fn ensure_lightwalletd(prefix: &str, name: &InstanceName) -> Result<()> {
             "--user",
             "0:0",
             "-p",
-            "127.0.0.1::9067",
+            &lightwalletd_bind,
             "-v",
             &format!("{prefix}-lightwalletd:/var/lib/lightwalletd"),
             &image,
@@ -470,18 +499,11 @@ fn ensure_lightwalletd(prefix: &str, name: &InstanceName) -> Result<()> {
 fn ensure_app(prefix: &str, name: &InstanceName) -> Result<()> {
     let target = format!("{prefix}-app");
     if !container_exists(&target)? {
-        let public_rpc = format!(
-            "http://127.0.0.1:{}",
-            published_port(&format!("{prefix}-zakura"), "18232/tcp")?
-        );
-        let public_lightwalletd = format!(
-            "http://127.0.0.1:{}",
-            published_port(&format!("{prefix}-lightwalletd"), "9067/tcp")?
-        );
-        let public_p2p = format!(
-            "127.0.0.1:{}",
-            published_port(&format!("{prefix}-zakura"), "18233/tcp")?
-        );
+        let ports = host_ports(0)?;
+        let public_rpc = format!("http://127.0.0.1:{}", ports.rpc);
+        let public_lightwalletd = format!("http://127.0.0.1:{}", ports.lightwalletd);
+        let public_p2p = format!("127.0.0.1:{}", ports.p2p);
+        let dashboard_bind = loopback_publish(ports.dashboard, 8080);
         let image = app_image();
         docker([
             "create",
@@ -492,7 +514,7 @@ fn ensure_app(prefix: &str, name: &InstanceName) -> Result<()> {
             "--label",
             &label(name),
             "-p",
-            "127.0.0.1::8080",
+            &dashboard_bind,
             "-e",
             "TSZ_LISTEN=0.0.0.0:8080",
             "-e",
@@ -1310,5 +1332,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("interrupted"));
+    }
+
+    #[test]
+    fn default_offset_uses_stable_loopback_ports() {
+        let ports = host_ports(0).unwrap();
+        assert_eq!(ports.dashboard, 32805);
+        assert_eq!(ports.rpc, 18232);
+        assert_eq!(ports.p2p, 18233);
+        assert_eq!(ports.lightwalletd, 9067);
+        assert_eq!(loopback_publish(ports.rpc, 18232), "127.0.0.1:18232:18232");
+        assert_eq!(
+            loopback_publish(ports.dashboard, 8080),
+            "127.0.0.1:32805:8080"
+        );
+    }
+
+    #[test]
+    fn port_offset_shifts_all_four_hosts_by_the_same_stride() {
+        let base = host_ports(0).unwrap();
+        let shifted = host_ports(10).unwrap();
+        assert_eq!(shifted.dashboard, base.dashboard + 10);
+        assert_eq!(shifted.rpc, base.rpc + 10);
+        assert_eq!(shifted.p2p, base.p2p + 10);
+        assert_eq!(shifted.lightwalletd, base.lightwalletd + 10);
+    }
+
+    #[test]
+    fn port_offset_rejects_values_that_are_not_multiples_of_ten() {
+        let err = host_ports(1).unwrap_err();
+        assert!(err.to_string().contains('1'));
     }
 }
