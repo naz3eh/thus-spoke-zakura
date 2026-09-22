@@ -402,6 +402,16 @@ fn loopback_publish(host: u16, container: u16) -> String {
     format!("127.0.0.1:{host}:{container}")
 }
 
+fn require_free_loopback(port: u16) -> Result<()> {
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(_) => bail!("port {port} is already in use on 127.0.0.1"),
+    }
+}
+
 fn prefix(name: &InstanceName) -> String {
     format!("tsz-{name}")
 }
@@ -738,6 +748,11 @@ impl StartHost for DockerHost {
     ) -> Result<Endpoints> {
         fs::create_dir_all(runtime.instance_dir(name))?;
         let prefix = prefix(name);
+        let ports = host_ports(0)?;
+        require_free_loopback(ports.dashboard)?;
+        require_free_loopback(ports.rpc)?;
+        require_free_loopback(ports.p2p)?;
+        require_free_loopback(ports.lightwalletd)?;
         ensure_network(&prefix)?;
         shutdown.check()?;
         for suffix in ["chain", "wallet", "lightwalletd", "config"] {
@@ -1362,5 +1377,17 @@ mod tests {
     fn port_offset_rejects_values_that_are_not_multiples_of_ten() {
         let err = host_ports(1).unwrap_err();
         assert!(err.to_string().contains('1'));
+    }
+
+    #[test]
+    fn reports_the_conflicting_loopback_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let err = require_free_loopback(port).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains(&port.to_string()),
+            "error should name port {port}, got {message}"
+        );
     }
 }
