@@ -141,13 +141,19 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn start(&self, name: &InstanceName, no_open: bool, json: bool) -> Result<()> {
+    pub fn start(
+        &self,
+        name: &InstanceName,
+        no_open: bool,
+        json: bool,
+        port_offset: u16,
+    ) -> Result<()> {
         self.doctor(false)?;
         for image in [app_image(), lightwalletd_image(), ZAKURA_IMAGE.to_owned()] {
             require_image(&image)?;
         }
         let shutdown = Shutdown::install()?;
-        self.start_with(name, no_open, json, &DockerHost, &shutdown)
+        self.start_with(name, no_open, json, port_offset, &DockerHost, &shutdown)
     }
 
     pub fn status(&self, name: &InstanceName, json: bool) -> Result<()> {
@@ -441,10 +447,9 @@ fn ensure_volume(volume: &str, name: &InstanceName) -> Result<()> {
     }
     Ok(())
 }
-fn ensure_zakura(prefix: &str, name: &InstanceName) -> Result<()> {
+fn ensure_zakura(prefix: &str, name: &InstanceName, ports: &HostPorts) -> Result<()> {
     let target = format!("{prefix}-zakura");
     if !container_exists(&target)? {
-        let ports = host_ports(0)?;
         let rpc_bind = loopback_publish(ports.rpc, 18232);
         let p2p_bind = loopback_publish(ports.p2p, 18233);
         docker([
@@ -474,11 +479,10 @@ fn ensure_zakura(prefix: &str, name: &InstanceName) -> Result<()> {
     }
     Ok(())
 }
-fn ensure_lightwalletd(prefix: &str, name: &InstanceName) -> Result<()> {
+fn ensure_lightwalletd(prefix: &str, name: &InstanceName, ports: &HostPorts) -> Result<()> {
     let target = format!("{prefix}-lightwalletd");
     if !container_exists(&target)? {
         let image = lightwalletd_image();
-        let ports = host_ports(0)?;
         let lightwalletd_bind = loopback_publish(ports.lightwalletd, 9067);
         docker([
             "create",
@@ -516,10 +520,9 @@ fn ensure_lightwalletd(prefix: &str, name: &InstanceName) -> Result<()> {
     }
     Ok(())
 }
-fn ensure_app(prefix: &str, name: &InstanceName) -> Result<()> {
+fn ensure_app(prefix: &str, name: &InstanceName, ports: &HostPorts) -> Result<()> {
     let target = format!("{prefix}-app");
     if !container_exists(&target)? {
-        let ports = host_ports(0)?;
         let public_rpc = format!("http://127.0.0.1:{}", ports.rpc);
         let public_lightwalletd = format!("http://127.0.0.1:{}", ports.lightwalletd);
         let public_p2p = format!("127.0.0.1:{}", ports.p2p);
@@ -744,6 +747,7 @@ trait StartHost {
         runtime: &Runtime,
         name: &InstanceName,
         shutdown: &Shutdown,
+        port_offset: u16,
     ) -> Result<Endpoints>;
     fn wait_ready(
         &self,
@@ -768,10 +772,11 @@ impl StartHost for DockerHost {
         runtime: &Runtime,
         name: &InstanceName,
         shutdown: &Shutdown,
+        port_offset: u16,
     ) -> Result<Endpoints> {
         fs::create_dir_all(runtime.instance_dir(name))?;
         let prefix = prefix(name);
-        let ports = host_ports(0)?;
+        let ports = host_ports(port_offset)?;
         require_free_loopback(ports.dashboard)?;
         require_free_loopback(ports.rpc)?;
         require_free_loopback(ports.p2p)?;
@@ -806,9 +811,9 @@ impl StartHost for DockerHost {
             shutdown.check()?;
         }
 
-        ensure_zakura(&prefix, name)?;
+        ensure_zakura(&prefix, name, &ports)?;
         shutdown.check()?;
-        ensure_lightwalletd(&prefix, name)?;
+        ensure_lightwalletd(&prefix, name, &ports)?;
         shutdown.check()?;
         let zakura_container = format!("{prefix}-zakura");
         docker(["start", &zakura_container])?;
@@ -825,7 +830,7 @@ impl StartHost for DockerHost {
         )?;
         docker(["start", &format!("{prefix}-lightwalletd")])?;
         shutdown.check()?;
-        ensure_app(&prefix, name)?;
+        ensure_app(&prefix, name, &ports)?;
         shutdown.check()?;
         docker(["start", &format!("{prefix}-app")])?;
         shutdown.check()?;
@@ -877,6 +882,7 @@ impl Runtime {
         name: &InstanceName,
         no_open: bool,
         json: bool,
+        port_offset: u16,
         host: &dyn StartHost,
         shutdown: &Shutdown,
     ) -> Result<()> {
@@ -889,7 +895,7 @@ impl Runtime {
         println!("Preparing a fresh {name} environment…");
         host.delete(self, name)?;
         println!("Starting {name}…");
-        let endpoints = host.allocate(self, name, shutdown)?;
+        let endpoints = host.allocate(self, name, shutdown, port_offset)?;
         shutdown.check()?;
         host.wait_ready(
             &endpoints,
@@ -1119,6 +1125,7 @@ mod tests {
             _runtime: &Runtime,
             name: &InstanceName,
             shutdown: &Shutdown,
+            _port_offset: u16,
         ) -> Result<Endpoints> {
             self.push(&format!("allocate:{name}"));
             shutdown.check()?;
@@ -1181,7 +1188,7 @@ mod tests {
         let (_sender, receiver) = std::sync::mpsc::channel();
         let shutdown = Shutdown::from_receiver(receiver);
         let err = runtime_for_tests()
-            .start_with(&name("alpha"), false, false, &host, &shutdown)
+            .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
             .unwrap_err();
         assert!(err.to_string().contains("dashboard did not become healthy"));
         let events = events.lock().unwrap().clone();
@@ -1210,7 +1217,7 @@ mod tests {
         let (_sender, receiver) = std::sync::mpsc::channel();
         let shutdown = Shutdown::from_receiver(receiver);
         let err = runtime_for_tests()
-            .start_with(&name("alpha"), false, false, &host, &shutdown)
+            .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
             .unwrap_err();
         assert!(err.to_string().contains("opening"));
         let events = events.lock().unwrap().clone();
@@ -1229,7 +1236,7 @@ mod tests {
         });
         let shutdown = Shutdown::from_receiver(receiver);
         runtime_for_tests()
-            .start_with(&name("alpha"), true, false, &host, &shutdown)
+            .start_with(&name("alpha"), true, false, 0, &host, &shutdown)
             .unwrap();
         let events = events.lock().unwrap().clone();
         assert!(!events.iter().any(|e| e.starts_with("open_url:")));
@@ -1244,7 +1251,7 @@ mod tests {
         let (_sender, receiver) = std::sync::mpsc::channel();
         let shutdown = Shutdown::from_receiver(receiver);
         let err = runtime_for_tests()
-            .start_with(&name("alpha"), false, false, &host, &shutdown)
+            .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
             .unwrap_err();
         assert!(err.to_string().contains("interrupted"));
         let events = events.lock().unwrap().clone();
@@ -1260,7 +1267,7 @@ mod tests {
         sender.send(()).unwrap();
         let shutdown = Shutdown::from_receiver(receiver);
         let err = runtime_for_tests()
-            .start_with(&name("alpha"), false, false, &host, &shutdown)
+            .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
             .unwrap_err();
         assert!(err.to_string().contains("interrupted"));
         let events = events.lock().unwrap().clone();
