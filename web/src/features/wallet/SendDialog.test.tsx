@@ -93,6 +93,45 @@ describe('SendDialog', () => {
     expect(body(fetchMock).idempotency_key).toHaveLength(36);
   });
 
+  it('reuses the idempotency key when the same submission is retried', async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError('response lost'));
+    renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
+    const amount = screen.getByLabelText('Amount (ZEC)');
+    const submit = screen.getByRole('button', { name: /Send ZEC/i });
+    await userEvent.clear(amount);
+    await userEvent.type(amount, '1');
+
+    await userEvent.click(submit);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(submit).toBeEnabled());
+    await userEvent.click(submit);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    expect(requestBody(fetchMock.mock.calls[0]?.[1]).idempotency_key).toBe(
+      requestBody(fetchMock.mock.calls[1]?.[1]).idempotency_key,
+    );
+  });
+
+  it('uses a new idempotency key after the payment parameters change', async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError('response lost'));
+    renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
+    const amount = screen.getByLabelText('Amount (ZEC)');
+    const submit = screen.getByRole('button', { name: /Send ZEC/i });
+    await userEvent.clear(amount);
+    await userEvent.type(amount, '1');
+    await userEvent.click(submit);
+    await waitFor(() => expect(submit).toBeEnabled());
+
+    await userEvent.clear(amount);
+    await userEvent.type(amount, '2');
+    await userEvent.click(submit);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    expect(requestBody(fetchMock.mock.calls[0]?.[1]).idempotency_key).not.toBe(
+      requestBody(fetchMock.mock.calls[1]?.[1]).idempotency_key,
+    );
+  });
+
   it('refuses a zero amount without calling the API', async () => {
     await submitAmount('0');
     expect(await screen.findByRole('alert')).toHaveTextContent('greater than zero');

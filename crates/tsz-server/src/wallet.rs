@@ -58,6 +58,11 @@ pub enum PaymentError {
     TreasuryExhausted,
 }
 
+pub struct PreparedPayment {
+    pub txid: String,
+    pub raw_transaction: Vec<u8>,
+}
+
 #[derive(Clone)]
 pub struct RealWallet {
     db: Arc<Mutex<Db>>,
@@ -289,14 +294,14 @@ impl RealWallet {
         Ok(())
     }
 
-    pub async fn send(
+    pub async fn prepare(
         &self,
         seed_hex: &str,
         from_account: u8,
         source_pool: &str,
         destination: &str,
         amount: u64,
-    ) -> Result<String> {
+    ) -> Result<PreparedPayment> {
         let account_index = from_account
             .checked_sub(1)
             .context("invalid source account")?;
@@ -393,11 +398,17 @@ impl RealWallet {
             .context("built transaction was not stored")?;
         let mut raw = vec![];
         tx.write(&mut raw)?;
-        drop(db);
+        Ok(PreparedPayment {
+            txid: txid.to_string(),
+            raw_transaction: raw,
+        })
+    }
+
+    pub async fn broadcast(&self, raw_transaction: &[u8]) -> Result<()> {
         let mut client = CompactTxStreamerClient::connect(self.lightwalletd.clone()).await?;
         let result = client
             .send_transaction(RawTransaction {
-                data: raw,
+                data: raw_transaction.to_vec(),
                 height: 0,
             })
             .await?
@@ -408,7 +419,7 @@ impl RealWallet {
                 result.error_message
             );
         }
-        Ok(txid.to_string())
+        Ok(())
     }
 
     pub async fn shield_coinbase(
