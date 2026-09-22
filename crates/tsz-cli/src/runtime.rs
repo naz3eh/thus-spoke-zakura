@@ -1429,7 +1429,7 @@ mod tests {
 
     #[test]
     fn endpoints_json_includes_regtest_and_plaintext_lightwalletd() {
-        let json = serde_json::to_value(&endpoints_for(&host_ports(0).unwrap())).unwrap();
+        let json = serde_json::to_value(endpoints_for(&host_ports(0).unwrap())).unwrap();
         assert_eq!(json["dashboard"], "http://127.0.0.1:32805");
         assert_eq!(json["rpc"], "http://127.0.0.1:18232");
         assert_eq!(json["lightwalletd"], "http://127.0.0.1:9067");
