@@ -56,12 +56,20 @@ impl FromStr for InstanceName {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+fn default_regtest() -> String {
+    "regtest".to_owned()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Endpoints {
     pub dashboard: String,
     pub rpc: String,
     pub lightwalletd: String,
     pub p2p: String,
+    #[serde(default = "default_regtest")]
+    pub network: String,
+    #[serde(default)]
+    pub tls: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,8 +151,10 @@ impl Runtime {
     }
 
     pub fn status(&self, name: &InstanceName, json: bool) -> Result<()> {
-        let endpoints = inspect_endpoints(&prefix(name))
-            .or_else(|_| self.read_instance(name).map(|i| i.endpoints))?;
+        let endpoints = self
+            .read_instance(name)
+            .map(|i| i.endpoints)
+            .or_else(|_| inspect_endpoints(&prefix(name)))?;
         let running = container_running(&format!("{}-app", prefix(name))).unwrap_or(false);
         if json {
             println!(
@@ -550,6 +560,17 @@ fn ensure_app(prefix: &str, name: &InstanceName) -> Result<()> {
     Ok(())
 }
 
+fn endpoints_for(ports: &HostPorts) -> Endpoints {
+    Endpoints {
+        dashboard: format!("http://127.0.0.1:{}", ports.dashboard),
+        rpc: format!("http://127.0.0.1:{}", ports.rpc),
+        lightwalletd: format!("http://127.0.0.1:{}", ports.lightwalletd),
+        p2p: format!("127.0.0.1:{}", ports.p2p),
+        network: default_regtest(),
+        tls: false,
+    }
+}
+
 fn inspect_endpoints(prefix: &str) -> Result<Endpoints> {
     Ok(Endpoints {
         dashboard: format!(
@@ -568,6 +589,8 @@ fn inspect_endpoints(prefix: &str) -> Result<Endpoints> {
             "127.0.0.1:{}",
             published_port(&format!("{prefix}-zakura"), "18233/tcp")?
         ),
+        network: default_regtest(),
+        tls: false,
     })
 }
 fn published_port(container: &str, port: &str) -> Result<u16> {
@@ -806,7 +829,7 @@ impl StartHost for DockerHost {
         shutdown.check()?;
         docker(["start", &format!("{prefix}-app")])?;
         shutdown.check()?;
-        let endpoints = inspect_endpoints(&prefix)?;
+        let endpoints = endpoints_for(&ports);
         runtime.write_instance(name, &endpoints)?;
         Ok(endpoints)
     }
@@ -986,11 +1009,15 @@ fn wait_for_zakura_tip(
         timeout.as_secs()
     )
 }
+fn format_endpoints(name: &InstanceName, e: &Endpoints) -> String {
+    format!(
+        "\n{name} is ready 🌸\n  Dashboard    {}\n  Zakura RPC   {}\n  lightwalletd {}  (network={}, tls={})\n  P2P          {}",
+        e.dashboard, e.rpc, e.lightwalletd, e.network, e.tls, e.p2p
+    )
+}
+
 fn print_endpoints(name: &InstanceName, e: &Endpoints) {
-    println!(
-        "\n{name} is ready 🌸\n  Dashboard    {}\n  Zakura RPC   {}\n  lightwalletd {}\n  P2P          {}",
-        e.dashboard, e.rpc, e.lightwalletd, e.p2p
-    );
+    println!("{}", format_endpoints(name, e));
 }
 fn open_url(url: &str) -> Result<()> {
     let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
@@ -1100,6 +1127,8 @@ mod tests {
                 rpc: "http://127.0.0.1:2".into(),
                 lightwalletd: "http://127.0.0.1:3".into(),
                 p2p: "127.0.0.1:4".into(),
+                network: default_regtest(),
+                tls: false,
             })
         }
 
@@ -1389,5 +1418,34 @@ mod tests {
             message.contains(&port.to_string()),
             "error should name port {port}, got {message}"
         );
+    }
+
+    #[test]
+    fn endpoints_json_includes_regtest_and_plaintext_lightwalletd() {
+        let json = serde_json::to_value(&endpoints_for(&host_ports(0).unwrap())).unwrap();
+        assert_eq!(json["dashboard"], "http://127.0.0.1:32805");
+        assert_eq!(json["rpc"], "http://127.0.0.1:18232");
+        assert_eq!(json["lightwalletd"], "http://127.0.0.1:9067");
+        assert_eq!(json["p2p"], "127.0.0.1:18233");
+        assert_eq!(json["network"], "regtest");
+        assert_eq!(json["tls"], false);
+    }
+
+    #[test]
+    fn ready_text_includes_regtest_and_tls_false() {
+        let text = format_endpoints(&name("default"), &endpoints_for(&host_ports(0).unwrap()));
+        assert!(text.contains("http://127.0.0.1:32805"));
+        assert!(text.contains("network=regtest"));
+        assert!(text.contains("tls=false"));
+    }
+
+    #[test]
+    fn endpoints_json_without_network_fields_still_deserializes() {
+        let parsed: Endpoints = serde_json::from_str(
+            r#"{"dashboard":"http://127.0.0.1:1","rpc":"http://127.0.0.1:2","lightwalletd":"http://127.0.0.1:3","p2p":"127.0.0.1:4"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.network, "regtest");
+        assert!(!parsed.tls);
     }
 }
