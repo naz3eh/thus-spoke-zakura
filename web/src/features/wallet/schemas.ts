@@ -8,14 +8,6 @@ export const FAUCET_MAX_ZATOSHI = 5n * ZATOSHIS_PER_ZEC;
 export const MINE_MIN_BLOCKS = 1;
 export const MINE_MAX_BLOCKS = 10_000;
 
-/**
- * Minimum ZIP-317 fee a send must leave behind: 2 logical actions at the
- * 5,000-zatoshi marginal fee (`wallet.rs`: `StandardFeeRule::Zip317`).
- * Multi-note or transparent spends can cost more; the server stays the
- * authority and reports a 422 this check cannot predict.
- */
-export const SEND_FEE_RESERVE_ZATOSHI = 10_000n;
-
 const poolField = z.enum(['transparent', 'orchard']);
 
 /** Selects and inputs hand back strings; the schema owns the conversion. */
