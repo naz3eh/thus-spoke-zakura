@@ -46,16 +46,33 @@ use zcash_protocol::{
 };
 use zip321::{Payment, TransactionRequest};
 
-use crate::db::Account;
+use crate::db::{Account, ZATOSHIS_PER_ZEC};
 
 type Db = WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, UnwrapErr<SysRng>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PaymentError {
-    #[error("insufficient spendable funds (have {available}, need {required} including fees)")]
+    #[error(
+        "insufficient spendable funds (have {}, need {} including fees)",
+        format_zec(*available),
+        format_zec(*required)
+    )]
     InsufficientFunds { available: u64, required: u64 },
     #[error("faucet treasury remains insufficient after replenishment")]
     TreasuryExhausted,
+}
+
+fn format_zec(zatoshi: u64) -> String {
+    let whole = zatoshi / ZATOSHIS_PER_ZEC;
+    let fraction = zatoshi % ZATOSHIS_PER_ZEC;
+    if fraction == 0 {
+        format!("{whole} ZEC")
+    } else {
+        format!(
+            "{whole}.{} ZEC",
+            format!("{fraction:08}").trim_end_matches('0')
+        )
+    }
 }
 
 #[derive(Clone)]
