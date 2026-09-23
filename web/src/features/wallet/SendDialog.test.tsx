@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { renderWithProviders, testAccounts } from '@/test/utils';
+import { renderWithProviders, requestUrl, testAccounts } from '@/test/utils';
 import { SendDialog } from './SendDialog';
 
 /**
@@ -20,9 +20,23 @@ function requestBody(init: RequestInit | undefined): SendBody {
   return JSON.parse(raw) as SendBody;
 }
 
+const QUOTE = {
+  available_zatoshi: 500_000_000,
+  fee_zatoshi: 10_000,
+  max_zatoshi: 499_990_000,
+};
+
 function mockSend() {
-  const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((_input, init) =>
-    Promise.resolve(
+  const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
+    if (requestUrl(input).endsWith('/send/quote')) {
+      return Promise.resolve(
+        new Response(JSON.stringify(QUOTE), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    }
+    return Promise.resolve(
       new Response(
         JSON.stringify({
           id: 'a',
@@ -39,13 +53,17 @@ function mockSend() {
         }),
         { status: 200, headers: { 'content-type': 'application/json' } },
       ),
-    ),
-  );
+    );
+  });
   return fetchMock;
 }
 
+// Filters out the quote fetch the dialog makes on mount.
+const sendCalls = (fetchMock: ReturnType<typeof mockSend>) =>
+  fetchMock.mock.calls.filter(([input]) => requestUrl(input).endsWith('/send'));
+
 const body = (fetchMock: ReturnType<typeof mockSend>): SendBody =>
-  requestBody(fetchMock.mock.calls[0]?.[1]);
+  requestBody(sendCalls(fetchMock)[0]?.[1]);
 
 describe('SendDialog', () => {
   let fetchMock: ReturnType<typeof mockSend>;
@@ -67,7 +85,7 @@ describe('SendDialog', () => {
 
   it('sends the amount as exact zatoshi', async () => {
     await submitAmount('1.5');
-    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
     expect(body(fetchMock).amount_zatoshi).toBe(150_000_000);
   });
 
@@ -77,32 +95,32 @@ describe('SendDialog', () => {
     // catching the old implementation; see money.test.ts for the value that
     // genuinely separates the two.
     await submitAmount('2.675');
-    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
     expect(body(fetchMock).amount_zatoshi).toBe(267_500_000);
   });
 
   it('sends a single zatoshi without rounding it away', async () => {
     await submitAmount('0.00000001');
-    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
     expect(body(fetchMock).amount_zatoshi).toBe(1);
   });
 
   it('carries an idempotency key so a retry cannot double-spend', async () => {
     await submitAmount('1');
-    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
     expect(body(fetchMock).idempotency_key).toHaveLength(36);
   });
 
   it('refuses a zero amount without calling the API', async () => {
     await submitAmount('0');
     expect(await screen.findByRole('alert')).toHaveTextContent('greater than zero');
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(sendCalls(fetchMock)).toHaveLength(0);
   });
 
   it('refuses more than eight decimal places without calling the API', async () => {
     await submitAmount('0.000000001');
     expect(await screen.findByRole('alert')).toHaveTextContent('8 decimal places');
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(sendCalls(fetchMock)).toHaveLength(0);
   });
 
   it('names the accounts and pools being moved between', () => {
@@ -142,24 +160,34 @@ describe('SendDialog', () => {
     await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
 
     expect(await screen.findByText(/holds 0 ZEC in the orchard pool/i)).toBeInTheDocument();
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(sendCalls(fetchMock)).toHaveLength(0);
   });
 
-  it('refuses to spend the whole balance because the fee needs some too', async () => {
-    // Account 1 holds exactly 5 ZEC; spending all of it leaves nothing for
-    // the fee and used to fail server-side with a generic 500 toast.
+  it('refuses to spend more than the quoted maximum, naming fee and cap', async () => {
     await submitAmount('5');
 
-    expect(
-      await screen.findByText(/leave at least 0.0001 ZEC for the network fee/i),
-    ).toBeInTheDocument();
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await screen.findByText(/0.0001 ZEC network fee/i)).toBeInTheDocument();
+    expect(await screen.findByText(/at most 4.9999 ZEC spendable/i)).toBeInTheDocument();
+    expect(sendCalls(fetchMock)).toHaveLength(0);
   });
 
-  it('accepts a send that still leaves the minimum fee behind', async () => {
+  it('accepts a send that fits the quoted maximum', async () => {
     await submitAmount('4.9999');
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
+    expect(body(fetchMock).amount_zatoshi).toBe(499_990_000);
+  });
+
+  it('fills the amount with the quoted maximum when Max is clicked', async () => {
+    renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
+
+    const max = await screen.findByRole('button', { name: 'Max' });
+    await waitFor(() => expect(max).toBeEnabled());
+    await userEvent.click(max);
+
+    expect(screen.getByLabelText('Amount (ZEC)')).toHaveValue('4.9999');
+    await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
     expect(body(fetchMock).amount_zatoshi).toBe(499_990_000);
   });
 

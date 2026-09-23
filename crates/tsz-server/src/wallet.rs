@@ -10,10 +10,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 use rand10::{rand_core::UnwrapErr, rngs::SysRng};
 use secrecy::{ExposeSecret, SecretVec};
+use serde::Serialize;
 use tokio::sync::Mutex;
 use zcash_client_backend::{
     data_api::{
-        Account as _, AccountBirthday, WalletRead, WalletWrite,
+        Account as _, AccountBirthday, InputSource, WalletRead, WalletWrite,
         chain::{BlockCache, BlockSource, ChainState, error},
         error::Error as WalletError,
         scanning::ScanRange,
@@ -25,6 +26,7 @@ use zcash_client_backend::{
         },
     },
     fees::{DustOutputPolicy, StandardFeeRule, standard::SingleOutputChangeStrategy},
+    proposal::Proposal,
     proto::service::compact_tx_streamer_client::CompactTxStreamerClient,
     proto::{
         compact_formats::CompactBlock,
@@ -60,6 +62,14 @@ pub enum PaymentError {
     InsufficientFunds { available: u64, required: u64 },
     #[error("faucet treasury remains insufficient after replenishment")]
     TreasuryExhausted,
+}
+
+/// Spendable balance, fee, and maximum sendable amount for emptying one pool.
+#[derive(Serialize)]
+pub struct SendQuote {
+    pub available_zatoshi: u64,
+    pub fee_zatoshi: u64,
+    pub max_zatoshi: u64,
 }
 
 fn format_zec(zatoshi: u64) -> String {
@@ -306,29 +316,18 @@ impl RealWallet {
         Ok(())
     }
 
-    pub async fn send(
-        &self,
-        seed_hex: &str,
-        from_account: u8,
+    /// Builds the proposal a send would use, without signing or broadcasting.
+    fn propose_send(
+        db: &mut Db,
+        params: &LocalNetwork,
+        account_id: AccountUuid,
         source_pool: &str,
-        destination: &str,
-        amount: u64,
-    ) -> Result<String> {
-        let account_index = from_account
-            .checked_sub(1)
-            .context("invalid source account")?;
-        let mut db = self.db.lock().await;
-        let account_id = *self
-            .account_ids
-            .get(account_index as usize)
-            .context("source account does not exist")?;
-        let params = regtest_network();
-        let recipient =
-            Address::decode(&params, destination).context("invalid destination address")?;
-        let amount = Zatoshis::from_u64(amount).map_err(|_| anyhow::anyhow!("invalid amount"))?;
+        recipient: &Address,
+        amount: Zatoshis,
+    ) -> Result<Proposal<StandardFeeRule, <Db as InputSource>::NoteRef>> {
         let proposal = if source_pool == "transparent" {
             let request = TransactionRequest::new(vec![Payment::new(
-                recipient.to_zcash_address(&params),
+                recipient.to_zcash_address(params),
                 Some(amount),
                 None,
                 None,
@@ -345,8 +344,8 @@ impl RealWallet {
             let policy = SpendPolicy::shielded_pools([])
                 .with_transparent(TransparentSpendPolicy::any_account_addr());
             propose_transfer::<_, _, _, _, Infallible>(
-                &mut *db,
-                &params,
+                db,
+                params,
                 account_id,
                 &selector,
                 &change,
@@ -358,12 +357,12 @@ impl RealWallet {
             )
         } else if source_pool == "orchard" {
             propose_standard_transfer_to_address::<_, _, Infallible>(
-                &mut *db,
-                &params,
+                db,
+                params,
                 StandardFeeRule::Zip317,
                 account_id,
                 ConfirmationsPolicy::MIN,
-                &recipient,
+                recipient,
                 amount,
                 None,
                 None,
@@ -384,6 +383,37 @@ impl RealWallet {
             }),
             error => anyhow::anyhow!("proposing {source_pool} transaction: {error}"),
         })?;
+        Ok(proposal)
+    }
+
+    pub async fn send(
+        &self,
+        seed_hex: &str,
+        from_account: u8,
+        source_pool: &str,
+        destination: &str,
+        amount: u64,
+    ) -> Result<String> {
+        let account_index = from_account
+            .checked_sub(1)
+            .context("invalid source account")?;
+        let mut db = self.db.lock().await;
+        let account_id = *self
+            .account_ids
+            .get(account_index as usize)
+            .context("source account does not exist")?;
+        let params = regtest_network();
+        let recipient =
+            Address::decode(&params, destination).context("invalid destination address")?;
+        let amount = Zatoshis::from_u64(amount).map_err(|_| anyhow::anyhow!("invalid amount"))?;
+        let proposal = Self::propose_send(
+            &mut db,
+            &params,
+            account_id,
+            source_pool,
+            &recipient,
+            amount,
+        )?;
         let seed = hex::decode(seed_hex)?;
         let usk = UnifiedSpendingKey::from_seed(
             &params,
@@ -426,6 +456,88 @@ impl RealWallet {
             );
         }
         Ok(txid.to_string())
+    }
+
+    /// Returns the exact fee and maximum spendable amount for emptying a pool.
+    pub async fn send_quote(
+        &self,
+        from_account: u8,
+        source_pool: &str,
+        destination: &str,
+    ) -> Result<SendQuote> {
+        let account_index = from_account
+            .checked_sub(1)
+            .context("invalid source account")?;
+        let mut db = self.db.lock().await;
+        let account_id = *self
+            .account_ids
+            .get(account_index as usize)
+            .context("source account does not exist")?;
+        let params = regtest_network();
+        let recipient =
+            Address::decode(&params, destination).context("invalid destination address")?;
+        let summary = db
+            .get_wallet_summary(ConfirmationsPolicy::MIN)?
+            .context("wallet has not scanned any blocks yet")?;
+        let balance = summary
+            .account_balances()
+            .get(&account_id)
+            .context("source account is missing from the wallet summary")?;
+        let available = u64::from(match source_pool {
+            "orchard" => balance.orchard_balance().total(),
+            "transparent" => balance.unshielded_balance().total(),
+            _ => bail!("source pool must be transparent or orchard"),
+        });
+        if available == 0 {
+            return Ok(SendQuote {
+                available_zatoshi: 0,
+                fee_zatoshi: 0,
+                max_zatoshi: 0,
+            });
+        }
+        // Proposing the whole balance always fails on the fee; `required`
+        // minus `available` is the exact fee for emptying the pool.
+        let probe = Self::propose_send(
+            &mut db,
+            &params,
+            account_id,
+            source_pool,
+            &recipient,
+            Zatoshis::from_u64(available).map_err(|_| anyhow::anyhow!("invalid amount"))?,
+        );
+        let (spendable, fee) = match probe {
+            Err(error) => match error.downcast_ref() {
+                Some(PaymentError::InsufficientFunds {
+                    available: spendable,
+                    required,
+                }) => (*spendable, required.saturating_sub(available)),
+                _ => return Err(error),
+            },
+            Ok(_) => bail!("a send of the entire balance proposed cleanly"),
+        };
+        let max = spendable.saturating_sub(fee);
+        if max == 0 {
+            return Ok(SendQuote {
+                available_zatoshi: spendable,
+                fee_zatoshi: fee,
+                max_zatoshi: 0,
+            });
+        }
+        // Re-propose the maximum to confirm it and read the fee it pays.
+        let proposal = Self::propose_send(
+            &mut db,
+            &params,
+            account_id,
+            source_pool,
+            &recipient,
+            Zatoshis::from_u64(max).map_err(|_| anyhow::anyhow!("invalid amount"))?,
+        )?;
+        let fee = u64::from(proposal.steps().first().balance().fee_required());
+        Ok(SendQuote {
+            available_zatoshi: spendable,
+            fee_zatoshi: fee,
+            max_zatoshi: max,
+        })
     }
 
     pub async fn shield_coinbase(

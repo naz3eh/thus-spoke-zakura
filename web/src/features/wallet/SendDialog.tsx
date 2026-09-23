@@ -6,9 +6,10 @@ import { Button } from '@/components/ui/Button';
 import { Field } from '@/components/ui/Field';
 import { useToast } from '@/components/ui/toast-context';
 import { errorMessage, type Account } from '@/lib/api';
-import { formatZecAmount } from '@/lib/money';
+import { formatZec, formatZecAmount } from '@/lib/money';
 import { useSend } from '@/hooks/mutations';
-import { SEND_FEE_RESERVE_ZATOSHI, sendSchema, type SendInput, type SendValues } from './schemas';
+import { useSendQuote } from '@/hooks/queries';
+import { sendSchema, type SendInput, type SendValues } from './schemas';
 import { controlStyles } from '@/components/ui/control-styles';
 import { SelectField } from './fields';
 import { POOL_OPTIONS, accountOptions } from './field-options';
@@ -41,6 +42,8 @@ export function SendDialog({
 
   const fromAccount = useWatch({ control: form.control, name: 'from_account' });
   const sourcePool = useWatch({ control: form.control, name: 'source_pool' });
+  const toAccount = useWatch({ control: form.control, name: 'to_account' });
+  const destinationPool = useWatch({ control: form.control, name: 'destination_pool' });
   const source = accounts.find((account) => account.id === Number(fromAccount));
   const available =
     source === undefined
@@ -49,16 +52,25 @@ export function SendDialog({
         ? source.orchard_zatoshi
         : source.transparent_zatoshi;
 
-  const submit = form.handleSubmit((values) => {
+  // The quote is a dry-run proposal, so its fee reflects real input selection.
+  const quote = useSendQuote({
+    from_account: Number(fromAccount),
+    to_account: Number(toAccount),
+    source_pool: sourcePool,
+    destination_pool: destinationPool,
+  });
+
+  const submit = form.handleSubmit(async (values) => {
     if (values.amount > available) {
       form.setError('amount', {
         message: `Account ${values.from_account} holds ${formatZecAmount(available)} in the ${values.source_pool} pool.`,
       });
       return;
     }
-    if (values.amount + SEND_FEE_RESERVE_ZATOSHI > available) {
+    const quoted = quote.data ?? (await quote.refetch()).data;
+    if (quoted !== undefined && values.amount > quoted.max_zatoshi) {
       form.setError('amount', {
-        message: `Account ${values.from_account} holds ${formatZecAmount(available)} in the ${values.source_pool} pool — leave at least ${formatZecAmount(SEND_FEE_RESERVE_ZATOSHI)} for the network fee.`,
+        message: `The ${formatZecAmount(quoted.fee_zatoshi)} network fee leaves at most ${formatZecAmount(quoted.max_zatoshi)} spendable — Account ${values.from_account} holds ${formatZecAmount(quoted.available_zatoshi)} in the ${values.source_pool} pool.`,
       });
       return;
     }
@@ -129,17 +141,40 @@ export function SendDialog({
 
         <Field
           label="Amount (ZEC)"
-          hint={`${formatZecAmount(available)} available in the ${sourcePool} pool.`}
+          hint={
+            quote.data !== undefined
+              ? `${formatZecAmount(quote.data.max_zatoshi)} spendable after a ${formatZecAmount(quote.data.fee_zatoshi)} network fee.`
+              : `${formatZecAmount(available)} available in the ${sourcePool} pool.`
+          }
           error={form.formState.errors.amount?.message}
         >
           {(aria) => (
-            <input
-              {...aria}
-              {...form.register('amount')}
-              inputMode="decimal"
-              autoComplete="off"
-              className={controlStyles}
-            />
+            <div className="flex items-stretch gap-2">
+              <input
+                {...aria}
+                {...form.register('amount')}
+                inputMode="decimal"
+                autoComplete="off"
+                className={controlStyles}
+              />
+              <Button
+                type="button"
+                variant="subtle"
+                size="sm"
+                disabled={quote.data === undefined || quote.data.max_zatoshi === 0n}
+                onClick={() => {
+                  const max = quote.data?.max_zatoshi;
+                  if (max === undefined) return;
+                  form.setValue('amount', formatZec(max), {
+                    shouldDirty: true,
+                    shouldValidate: true,
+                  });
+                  form.clearErrors('amount');
+                }}
+              >
+                Max
+              </Button>
+            </div>
           )}
         </Field>
 
