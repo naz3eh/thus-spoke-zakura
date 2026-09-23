@@ -8,7 +8,7 @@ import { useToast } from '@/components/ui/toast-context';
 import { errorMessage, type Account } from '@/lib/api';
 import { formatZecAmount } from '@/lib/money';
 import { useSend } from '@/hooks/mutations';
-import { sendSchema, type SendInput, type SendValues } from './schemas';
+import { SEND_FEE_RESERVE_ZATOSHI, sendSchema, type SendInput, type SendValues } from './schemas';
 import { controlStyles } from '@/components/ui/control-styles';
 import { SelectField } from './fields';
 import { POOL_OPTIONS, accountOptions } from './field-options';
@@ -53,6 +53,12 @@ export function SendDialog({
     if (values.amount > available) {
       form.setError('amount', {
         message: `Account ${values.from_account} holds ${formatZecAmount(available)} in the ${values.source_pool} pool.`,
+      });
+      return;
+    }
+    if (values.amount + SEND_FEE_RESERVE_ZATOSHI > available) {
+      form.setError('amount', {
+        message: `Account ${values.from_account} holds ${formatZecAmount(available)} in the ${values.source_pool} pool — leave at least ${formatZecAmount(SEND_FEE_RESERVE_ZATOSHI)} for the network fee.`,
       });
       return;
     }

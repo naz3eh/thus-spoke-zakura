@@ -145,6 +145,24 @@ describe('SendDialog', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it('refuses to spend the whole balance because the fee needs some too', async () => {
+    // Account 1 holds exactly 5 ZEC; spending all of it leaves nothing for
+    // the fee and used to fail server-side with a generic 500 toast.
+    await submitAmount('5');
+
+    expect(
+      await screen.findByText(/leave at least 0.0001 ZEC for the network fee/i),
+    ).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('accepts a send that still leaves the minimum fee behind', async () => {
+    await submitAmount('4.9999');
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(body(fetchMock).amount_zatoshi).toBe(499_990_000);
+  });
+
   it('shows what the selected source can actually spend', () => {
     renderWithProviders(
       <SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} defaultAccountId={1} />,

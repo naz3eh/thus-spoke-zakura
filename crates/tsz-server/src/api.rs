@@ -1028,6 +1028,9 @@ impl From<anyhow::Error> for ApiError {
         Self {
             status: match error.downcast_ref() {
                 Some(PaymentError::TreasuryExhausted) => StatusCode::SERVICE_UNAVAILABLE,
+                Some(PaymentError::InsufficientFunds { .. }) => {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                }
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             },
             message: error.to_string(),
@@ -1328,6 +1331,18 @@ mod tests {
         assert_eq!(
             ApiError::from(anyhow::Error::new(PaymentError::TreasuryExhausted)).status,
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn an_unaffordable_send_is_reported_as_a_client_error() {
+        assert_eq!(
+            ApiError::from(anyhow::Error::new(PaymentError::InsufficientFunds {
+                available: 100_000_000,
+                required: 100_010_000,
+            }))
+            .status,
+            StatusCode::UNPROCESSABLE_ENTITY
         );
     }
 
