@@ -410,7 +410,6 @@ async fn send(
 #[derive(Deserialize)]
 struct SendQuoteRequest {
     from_account: u8,
-    to_account: u8,
     source_pool: String,
     destination_pool: String,
 }
@@ -419,8 +418,9 @@ async fn send_quote(
     Json(req): Json<SendQuoteRequest>,
 ) -> ApiResult<Json<SendQuote>> {
     require_user_account(req.from_account)?;
-    require_user_account(req.to_account)?;
-    let destination = state.0.store.account(req.to_account)?;
+    // The fee depends only on the destination's receiver kinds, which every
+    // account shares, so the source account's own address quotes the same fee.
+    let destination = state.0.store.account(req.from_account)?;
     let address = if req.destination_pool == "transparent" {
         destination.transparent_address
     } else if req.destination_pool == "orchard" {
