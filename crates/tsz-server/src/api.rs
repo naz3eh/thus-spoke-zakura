@@ -160,6 +160,7 @@ impl AppState {
         if changed {
             notify(self, "wallet");
         }
+        reconcile_unconfirmed(self).await?;
         Ok(())
     }
 
@@ -370,7 +371,7 @@ async fn send(
     require_user_account(req.from_account)?;
     require_user_account(req.to_account)?;
     if let Some(existing) = state.0.store.activity_for_key(&req.idempotency_key)? {
-        return Ok(Json(existing));
+        return Ok(Json(confirm_after_mining(&state, existing).await?));
     }
     state.synchronize_latest().await?;
     let destination = state.0.store.account(req.to_account)?;
@@ -503,11 +504,11 @@ async fn faucet_address(
     let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
     let txid =
         send_with_replenishment(&state, &seed, &treasury, &req.address, req.amount_zatoshi).await?;
-    let hashes = mine_and_sync(&state, 1).await?;
-    let block_hash = hashes
-        .into_iter()
-        .next()
-        .context("Zakura did not return the confirmation block hash")?;
+    mine_and_sync(&state, 1).await?;
+    let mined = state.0.rpc.transaction(&txid).await?;
+    let block_hash = confirmed_block_hash(&mined)
+        .context("faucet transaction was not included in a block")?
+        .to_owned();
     Ok(Json(FaucetAddressResponse {
         address: req.address,
         amount_zatoshi: req.amount_zatoshi,
@@ -524,7 +525,7 @@ async fn fund_from_treasury(
     idempotency_key: &str,
 ) -> anyhow::Result<Activity> {
     if let Some(existing) = state.0.store.activity_for_key(idempotency_key)? {
-        return Ok(existing);
+        return confirm_after_mining(state, existing).await;
     }
     let destination = state.0.store.account(account_id)?;
     let address = match pool {
@@ -542,13 +543,7 @@ async fn fund_from_treasury(
         .0
         .store
         .faucet(account_id, pool, amount_zatoshi, idempotency_key, &txid)?;
-    let hashes = mine_and_sync(state, 1).await?;
-    let confirmed = state.0.store.confirm(
-        &pending.id,
-        hashes.first().map(String::as_str).unwrap_or(""),
-    )?;
-    notify(state, "wallet");
-    Ok(confirmed)
+    confirm_after_mining(state, pending).await
 }
 
 #[derive(Deserialize)]
@@ -734,18 +729,22 @@ async fn mine_and_sync(state: &AppState, blocks: u32) -> anyhow::Result<Vec<Stri
 
 pub async fn provision_initial_balance(state: &AppState) -> anyhow::Result<()> {
     const INITIAL_FUNDING_KEY: &str = "startup-account-1-orchard-v1";
+    if let Some(existing) = state.0.store.activity_for_key(INITIAL_FUNDING_KEY)?
+        && existing.status == "confirmed"
+    {
+        return Ok(());
+    }
+    let seed = state.0.store.seed()?;
+    let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
     if state
         .0
         .store
         .activity_for_key(INITIAL_FUNDING_KEY)?
-        .is_some()
+        .is_none()
     {
-        return Ok(());
+        // A fresh wallet needs scanned blocks before a proposal can determine its target height.
+        replenish_treasury(state, &seed, &treasury).await?;
     }
-    // A fresh wallet needs scanned blocks before a proposal can determine its target height.
-    let seed = state.0.store.seed()?;
-    let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
-    replenish_treasury(state, &seed, &treasury).await?;
     fund_from_treasury(
         state,
         1,
@@ -904,11 +903,7 @@ async fn address(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    if !address.starts_with('t') {
-        return Err(ApiError::bad_request(
-            "only transparent addresses have public explorer activity",
-        ));
-    }
+    require_transparent_address(&address)?;
     let balance: Value = state
         .0
         .rpc
@@ -942,18 +937,66 @@ async fn events(
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
-async fn confirm_after_mining(state: &AppState, pending: Activity) -> ApiResult<Activity> {
-    match state.0.rpc.generate(1).await {
-        Ok(hashes) => {
-            let confirmed = state.0.store.confirm(
-                &pending.id,
-                hashes.first().map(String::as_str).unwrap_or(""),
-            )?;
-            notify(state, "wallet");
-            Ok(confirmed)
+fn confirmed_block_hash(tx: &Value) -> Option<&str> {
+    let confirmations = tx.get("confirmations").and_then(Value::as_u64).unwrap_or(0);
+    if confirmations == 0 {
+        return None;
+    }
+    tx.get("blockhash")
+        .and_then(Value::as_str)
+        .filter(|hash| !hash.is_empty())
+}
+
+fn apply_confirmation(store: &Store, pending: &Activity, tx: &Value) -> anyhow::Result<Activity> {
+    match confirmed_block_hash(tx) {
+        Some(hash) => store.confirm(&pending.id, hash),
+        None => Ok(pending.clone()),
+    }
+}
+
+async fn confirm_from_chain(state: &AppState, pending: Activity) -> anyhow::Result<Activity> {
+    if pending.status == "confirmed" {
+        return Ok(pending);
+    }
+    match state.0.rpc.transaction(&pending.txid).await {
+        Ok(tx) => {
+            let updated = apply_confirmation(&state.0.store, &pending, &tx)?;
+            if updated.status == "confirmed" {
+                notify(state, "wallet");
+            }
+            Ok(updated)
         }
         Err(error) => {
-            tracing::warn!(%error, activity = %pending.id, "transaction recorded but auto-mine failed");
+            tracing::warn!(
+                %error,
+                txid = %pending.txid,
+                "could not fetch transaction for confirmation"
+            );
+            Ok(pending)
+        }
+    }
+}
+
+async fn reconcile_unconfirmed(state: &AppState) -> anyhow::Result<()> {
+    for activity in state.0.store.unconfirmed_activities()? {
+        confirm_from_chain(state, activity).await?;
+    }
+    Ok(())
+}
+
+async fn confirm_after_mining(state: &AppState, pending: Activity) -> anyhow::Result<Activity> {
+    let pending = confirm_from_chain(state, pending).await?;
+    if pending.status == "confirmed" {
+        return Ok(pending);
+    }
+    match mine_and_sync(state, 1).await {
+        Ok(_) => confirm_from_chain(state, pending).await,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                activity = %pending.id,
+                "transaction recorded but auto-mine failed"
+            );
             Ok(pending)
         }
     }
@@ -987,6 +1030,15 @@ fn require_faucet_address(value: &str) -> ApiResult<()> {
         )),
         None => Err(ApiError::bad_request(
             "destination is not a valid Regtest address",
+        )),
+    }
+}
+
+fn require_transparent_address(value: &str) -> ApiResult<()> {
+    match Address::decode(&regtest_network(), value) {
+        Some(Address::Transparent(_)) => Ok(()),
+        _ => Err(ApiError::bad_request(
+            "only transparent addresses have public explorer activity",
         )),
     }
 }
@@ -1202,6 +1254,74 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_block_hash_requires_confirmations_and_blockhash() {
+        assert_eq!(
+            confirmed_block_hash(&json!({
+                "txid": "abc",
+                "confirmations": 1,
+                "blockhash": "0".repeat(64)
+            })),
+            Some("0000000000000000000000000000000000000000000000000000000000000000")
+        );
+        assert_eq!(
+            confirmed_block_hash(&json!({
+                "txid": "abc",
+                "confirmations": 0,
+                "blockhash": "0".repeat(64)
+            })),
+            None
+        );
+        assert_eq!(
+            confirmed_block_hash(&json!({"txid": "abc", "confirmations": 3})),
+            None
+        );
+        assert_eq!(
+            confirmed_block_hash(&json!({"txid": "abc", "blockhash": "0".repeat(64)})),
+            None
+        );
+        assert_eq!(
+            confirmed_block_hash(&json!({
+                "txid": "abc",
+                "confirmations": 1,
+                "blockhash": ""
+            })),
+            None
+        );
+        assert_eq!(confirmed_block_hash(&json!({"txid": "abc"})), None);
+    }
+
+    #[test]
+    fn apply_confirmation_uses_node_blockhash_not_a_generate_hash() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let pending = store
+            .transfer(1, 2, "orchard", "orchard", 12_000, "issue-67", "txid-abc")
+            .unwrap();
+        assert_eq!(pending.status, "broadcast");
+
+        let generate_hash = "generate-hash-that-must-not-be-stored";
+        let mempool = json!({"txid": "txid-abc", "confirmations": 0});
+        let still = apply_confirmation(&store, &pending, &mempool).unwrap();
+        assert_eq!(still.status, "broadcast");
+        assert_eq!(still.block_hash, None);
+
+        let mined = json!({
+            "txid": "txid-abc",
+            "confirmations": 1,
+            "blockhash": "b".repeat(64)
+        });
+        let confirmed = apply_confirmation(&store, &pending, &mined).unwrap();
+        let expected_hash = "b".repeat(64);
+        assert_eq!(confirmed.status, "confirmed");
+        assert_eq!(
+            confirmed.block_hash.as_deref(),
+            Some(expected_hash.as_str())
+        );
+        assert_ne!(confirmed.block_hash.as_deref(), Some(generate_hash));
+        assert_eq!(confirmed.txid, "txid-abc");
+    }
+
+    #[test]
     fn reserves_the_treasury_account_from_public_operations() {
         for id in 1..=USER_ACCOUNT_COUNT {
             assert!(require_user_account(id).is_ok());
@@ -1218,6 +1338,23 @@ mod tests {
         assert!(require_faucet_address(&account.unified_address).is_ok());
         assert!(require_faucet_address(&account.transparent_address).is_ok());
         assert!(require_faucet_address("not-an-address").is_err());
+    }
+
+    #[tokio::test]
+    async fn explorer_rejects_malformed_addresses_before_reaching_zakura() {
+        let (state, _dir) = state_with_local_wallet();
+        let account = state.0.store.account(1).unwrap();
+        assert!(require_transparent_address(&account.transparent_address).is_ok());
+
+        let response = router(state)
+            .oneshot(
+                Request::get("/api/v1/addresses/tmOOOOOOOOOOOOOOOOOOOOOOOO")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
