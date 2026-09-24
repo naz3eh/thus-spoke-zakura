@@ -26,11 +26,11 @@ const QUOTE = {
   max_zatoshi: 499_990_000,
 };
 
-function mockSend() {
-  const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
+function sendImpl(quote: typeof QUOTE) {
+  return (input: RequestInfo | URL, init?: RequestInit) => {
     if (requestUrl(input).endsWith('/send/quote')) {
       return Promise.resolve(
-        new Response(JSON.stringify(QUOTE), {
+        new Response(JSON.stringify(quote), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         }),
@@ -54,8 +54,11 @@ function mockSend() {
         { status: 200, headers: { 'content-type': 'application/json' } },
       ),
     );
-  });
-  return fetchMock;
+  };
+}
+
+function mockSend(quote = QUOTE) {
+  return vi.spyOn(globalThis, 'fetch').mockImplementation(sendImpl(quote));
 }
 
 // Filters out the quote fetch the dialog makes on mount.
@@ -189,6 +192,34 @@ describe('SendDialog', () => {
     await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
     await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
     expect(body(fetchMock).amount_zatoshi).toBe(499_990_000);
+  });
+
+  it('disables Max when nothing is spendable after the fee', async () => {
+    fetchMock.mockImplementation(sendImpl({ ...QUOTE, available_zatoshi: 10_000, max_zatoshi: 0 }));
+    renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
+
+    expect(await screen.findByRole('button', { name: 'Max' })).toBeDisabled();
+  });
+
+  it('quotes the fee without the destination account', async () => {
+    renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
+
+    const call = await waitFor(() => {
+      const found = fetchMock.mock.calls.find(([input]) =>
+        requestUrl(input).endsWith('/send/quote'),
+      );
+      expect(found).toBeDefined();
+      return found as [RequestInfo | URL, RequestInit | undefined];
+    });
+    const body = JSON.parse(typeof call[1]?.body === 'string' ? call[1].body : '{}') as Record<
+      string,
+      unknown
+    >;
+    expect(body).toEqual({
+      from_account: 1,
+      source_pool: 'orchard',
+      destination_pool: 'orchard',
+    });
   });
 
   it('shows what the selected source can actually spend', () => {

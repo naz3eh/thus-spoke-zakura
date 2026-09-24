@@ -42,7 +42,6 @@ export function SendDialog({
 
   const fromAccount = useWatch({ control: form.control, name: 'from_account' });
   const sourcePool = useWatch({ control: form.control, name: 'source_pool' });
-  const toAccount = useWatch({ control: form.control, name: 'to_account' });
   const destinationPool = useWatch({ control: form.control, name: 'destination_pool' });
   const source = accounts.find((account) => account.id === Number(fromAccount));
   const available =
@@ -55,7 +54,6 @@ export function SendDialog({
   // The quote is a dry-run proposal, so its fee reflects real input selection.
   const quote = useSendQuote({
     from_account: Number(fromAccount),
-    to_account: Number(toAccount),
     source_pool: sourcePool,
     destination_pool: destinationPool,
   });

@@ -195,7 +195,6 @@ export const sendQuoteSchema = z.object({
 export type SendQuote = z.infer<typeof sendQuoteSchema>;
 export interface SendQuoteInput {
   from_account: number;
-  to_account: number;
   source_pool: Pool;
   destination_pool: Pool;
 }

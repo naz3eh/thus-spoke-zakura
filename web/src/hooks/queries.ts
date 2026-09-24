@@ -63,7 +63,7 @@ export function useTransaction(txid: string): UseQueryResult<Transaction> {
   });
 }
 
-/** The fee depends on the destination pool too, so all four fields key it. */
+/** The fee depends on the source and the destination pool, not the destination account. */
 export function useSendQuote(params: SendQuoteInput): UseQueryResult<SendQuote> {
   return useQuery({
     queryKey: queryKeys.sendQuote(params),
