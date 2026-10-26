@@ -444,7 +444,10 @@ fn quote_max_amount(
 }
 
 impl Runtime {
-    fn instance_client(&self, name: &InstanceName) -> Result<(String, reqwest::blocking::Client)> {
+    pub(crate) fn instance_client(
+        &self,
+        name: &InstanceName,
+    ) -> Result<(String, reqwest::blocking::Client)> {
         let app_container = format!("{}-app", prefix(name));
         if !container_running(&app_container)? {
             bail!("environment {name} is not running; start it with `ths --name {name}`");
