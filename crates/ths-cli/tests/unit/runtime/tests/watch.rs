@@ -53,7 +53,7 @@ fn watch(
     json: bool,
     probe_states: Vec<EnvironmentState>,
     tick: impl Fn(Duration) -> Result<Tick>,
-) -> (Result<()>, String) {
+) -> (Result<()>, String, String) {
     watch_limited(responses, tty, json, None, probe_states, tick)
 }
 
@@ -64,26 +64,32 @@ fn watch_limited(
     limit: Option<u32>,
     probe_states: Vec<EnvironmentState>,
     tick: impl Fn(Duration) -> Result<Tick>,
-) -> (Result<()>, String) {
+) -> (Result<()>, String, String) {
     let (url, _requests) = serve(responses);
     let mut out = Vec::new();
+    let mut err = Vec::new();
     let result = runtime_for_tests().wallet_activity_watch_with(
         &name("alpha"),
         &url,
         &reqwest::blocking::Client::new(),
         &mut out,
+        &mut err,
         tty,
         limit,
         json,
         &probes(probe_states),
         &tick,
     );
-    (result, String::from_utf8(out).unwrap())
+    (
+        result,
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
 }
 
 #[test]
 fn watch_emits_piped_snapshots_only_on_change() {
-    let (result, output) = watch(
+    let (result, output, _err) = watch(
         vec![
             ("200 OK", "[]".to_owned()),
             ("200 OK", "[]".to_owned()),
@@ -104,7 +110,7 @@ fn watch_emits_piped_snapshots_only_on_change() {
 
 #[test]
 fn watch_redraws_every_poll_on_tty() {
-    let (result, output) = watch(
+    let (result, output, _err) = watch(
         vec![("200 OK", "[]".to_owned()), ("200 OK", "[]".to_owned())],
         true,
         false,
@@ -118,7 +124,7 @@ fn watch_redraws_every_poll_on_tty() {
 
 #[test]
 fn watch_marks_stopped_and_recovers() {
-    let (result, output) = watch(
+    let (result, output, _err) = watch(
         vec![
             ("200 OK", "[]".to_owned()),
             ("500 Internal Server Error", String::new()),
@@ -138,7 +144,7 @@ fn watch_marks_stopped_and_recovers() {
 
 #[test]
 fn watch_reports_unreachable_reads_and_keeps_polling() {
-    let (result, output) = watch(
+    let (result, output, _err) = watch(
         vec![
             ("200 OK", "[]".to_owned()),
             ("500 Internal Server Error", String::new()),
@@ -157,7 +163,7 @@ fn watch_reports_unreachable_reads_and_keeps_polling() {
 
 #[test]
 fn watch_json_emits_ndjson_snapshots_only_on_change() {
-    let (result, output) = watch(
+    let (result, output, _err) = watch(
         vec![
             ("200 OK", "[]".to_owned()),
             ("200 OK", "[]".to_owned()),
@@ -185,7 +191,7 @@ fn watch_json_emits_ndjson_snapshots_only_on_change() {
 
 #[test]
 fn watch_exits_when_the_environment_was_deleted() {
-    let (result, output) = watch(
+    let (result, output, _err) = watch(
         vec![("500 Internal Server Error", String::new())],
         false,
         false,
@@ -201,7 +207,7 @@ fn watch_exits_when_the_environment_was_deleted() {
 
 #[test]
 fn watch_exits_when_the_monitor_reports_deletion() {
-    let (result, _output) = watch(
+    let (result, _output, _err) = watch(
         vec![("200 OK", "[]".to_owned())],
         false,
         false,
@@ -221,12 +227,14 @@ fn watch_forwards_the_limit_to_every_poll() {
         ("200 OK", "[]".to_owned()),
     ]);
     let mut out = Vec::new();
+    let mut err = Vec::new();
     runtime_for_tests()
         .wallet_activity_watch_with(
             &name("alpha"),
             &url,
             &reqwest::blocking::Client::new(),
             &mut out,
+            &mut err,
             false,
             Some(5),
             false,
@@ -242,7 +250,7 @@ fn watch_forwards_the_limit_to_every_poll() {
 
 #[test]
 fn watch_interrupted_exits_cleanly() {
-    let (result, _output) = watch(
+    let (result, _output, _err) = watch(
         vec![("200 OK", "[]".to_owned())],
         false,
         false,
@@ -250,4 +258,60 @@ fn watch_interrupted_exits_cleanly() {
         |_| Ok(Tick::Ended(Ended::Interrupted)),
     );
     result.unwrap();
+}
+
+#[test]
+fn watch_bounds_a_stalled_read_by_the_request_timeout() {
+    let (url, _requests) = serve(vec![("hang", String::new())]);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(50))
+        .build()
+        .unwrap();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+
+    let started = Instant::now();
+    runtime_for_tests()
+        .wallet_activity_watch_with(
+            &name("alpha"),
+            &url,
+            &client,
+            &mut out,
+            &mut err,
+            false,
+            None,
+            false,
+            &probes(vec![]),
+            &ticks(2),
+        )
+        .unwrap();
+
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "stalled reads must time out instead of blocking the loop: {:?}",
+        started.elapsed()
+    );
+    let output = String::from_utf8(out).unwrap();
+    assert!(output.contains("unreachable ("), "{output}");
+}
+
+#[test]
+fn watch_json_warns_again_after_a_recovered_outage() {
+    let (result, _output, err) = watch(
+        vec![
+            ("200 OK", "[]".to_owned()),
+            ("500 Internal Server Error", String::new()),
+            ("200 OK", "[]".to_owned()),
+            ("500 Internal Server Error", String::new()),
+        ],
+        false,
+        true,
+        vec![EnvironmentState::Stopped, EnvironmentState::Stopped],
+        ticks(3),
+    );
+
+    result.unwrap();
+    // The warning state resets on a successful read, so a second outage with
+    // the same error warns again instead of staying silent.
+    assert_eq!(err.matches("environment alpha stopped").count(), 2, "{err}");
 }

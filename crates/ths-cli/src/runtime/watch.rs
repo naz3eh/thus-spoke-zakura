@@ -3,6 +3,8 @@ use crate::client::{activity_history, render_activity_history};
 use std::io::{IsTerminal, Write};
 
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
+// Bounds how long a stalled read can delay Ctrl+C and deletion handling.
+const WATCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
 
 pub(super) enum Tick {
@@ -32,7 +34,7 @@ impl Runtime {
         json: bool,
     ) -> Result<()> {
         let shutdown = Shutdown::install()?;
-        let (dashboard, client) = self.instance_client(name)?;
+        let (dashboard, client) = self.instance_client_with_timeout(name, WATCH_REQUEST_TIMEOUT)?;
         let app_container = format!("{}-app", prefix(name));
         // Watching the app container ends the loop promptly on `stop`/`reset`
         // from another shell. When it cannot be resolved, the record check
@@ -50,6 +52,7 @@ impl Runtime {
             &dashboard,
             &client,
             std::io::stdout().lock(),
+            std::io::stderr().lock(),
             std::io::stdout().is_terminal(),
             limit,
             json,
@@ -79,6 +82,7 @@ impl Runtime {
         dashboard: &str,
         client: &reqwest::blocking::Client,
         mut out: impl Write,
+        mut err_out: impl Write,
         tty: bool,
         limit: Option<u32>,
         json: bool,
@@ -94,6 +98,7 @@ impl Runtime {
             let state = match activity_history(dashboard, client, name, limit) {
                 Ok(activity) => {
                     last_update = Some(watch_timestamp());
+                    warned = None;
                     last_body = Some(if json {
                         serde_json::to_string(&activity)?
                     } else {
@@ -119,7 +124,11 @@ impl Runtime {
                 }
                 let marker = state_marker(&state);
                 if !marker.is_empty() && warned.as_deref() != Some(marker) {
-                    eprintln!("{}", status_line(name, last_update.as_deref(), &state));
+                    writeln!(
+                        err_out,
+                        "{}",
+                        status_line(name, last_update.as_deref(), &state)
+                    )?;
                     warned = Some(marker.to_owned());
                 }
             } else {
